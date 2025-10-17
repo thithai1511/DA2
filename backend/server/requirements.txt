@@ -1,0 +1,9 @@
+# File: backend/requirements.txt
+# Muc dich: danh sach thu vien Python can cai cho FastAPI backend
+
+fastapi
+uvicorn
+opencv-python
+face_recognition
+pymysql
+python-dotenv
