@@ -1,0 +1,6 @@
+nohup: ignoring input
+Nhap MSSV: Traceback (most recent call last):
+  File "/home/thith/DA2/FaceDetect.py", line 9, in <module>
+    student_id = input("Nhap MSSV: ").strip()
+                 ^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 9] Bad file descriptor

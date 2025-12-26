@@ -1,0 +1,169 @@
+# live_recognize_picam.py
+# Live nhan dien bang Haar + MobileFaceNet + PiCamera2 (fallback OpenCV)
+# Comment khong dau
+
+import os, time, argparse
+import numpy as np
+import cv2
+
+from pathlib import Path
+from mobilefacenet_onnx import MobileFaceNet, l2norm  # type: ignore
+from detect_face_haar import detect_boxes, crop_face_bgr  # type: ignore
+
+HERE = Path(__file__).resolve().parent
+MODEL_PATH  = HERE / "models" / "mobilefacenet.onnx"
+INDEX_PATH  = HERE / "models" / "encodings.npz"
+
+# tai index
+def load_index():
+    if not INDEX_PATH.exists():
+        raise FileNotFoundError(f"Missing index: {INDEX_PATH}")
+    data = np.load(str(INDEX_PATH), allow_pickle=True)
+    labels = data["labels"].tolist()
+    embs   = data["embs"].astype(np.float32)
+    return labels, embs
+
+# nhan dien tren 1 frame BGR
+def recognize_faces(mbf, labels, embs, frame_bgr, th: float,
+                    scale_factor: float, neighbors: int, min_size: int, margin: float):
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    # phat hien bbox
+    boxes = detect_boxes(gray,
+                         scale_factor=scale_factor,
+                         min_neighbors=neighbors,
+                         min_size=(min_size, min_size))
+
+    res = []
+    if len(boxes) == 0:
+        return res
+
+    size = getattr(mbf, "size", 112)  # an toan neu wrapper chua co size
+    for (x, y, w, h) in boxes:
+        face = crop_face_bgr(frame_bgr, (x, y, w, h), out_size=size, margin=margin)
+        if face is None:
+            continue
+        emb = mbf.embed_bgr(face)          # (D,)
+        emb = l2norm(emb)                   # chuan hoa
+
+        # cosine voi tat ca mau
+        sims = embs @ emb
+        k = int(np.argmax(sims))
+        score = float(sims[k])
+        name  = labels[k] if score >= th else "Unknown"
+
+        res.append(((x, y, w, h), name, score))
+    return res
+
+def draw_ui(img, results, fps):
+    # ve bbox + ten + score
+    for (x, y, w, h), name, score in results:
+        color = (80, 220, 100) if name != "Unknown" else (0, 255, 255)
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+        label = f"{name} {score:.3f}"
+        cv2.putText(img, label, (x, max(0, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    cv2.putText(img, f"FPS: {fps:.1f}", (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+    return img
+
+def cap_picam(width, height):
+    # doc 1 frame tu PiCamera2
+    from picamera2 import Picamera2
+    picam = Picamera2()
+    config = picam.create_preview_configuration(main={"format": "BGR888",
+                                                      "size": (width, height)})
+    picam.configure(config)
+    picam.start()
+    time.sleep(0.1)
+    return picam
+
+def cap_opencv(width, height):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        # fallback gstreamer libcamera -> opencv
+        cap = cv2.VideoCapture(
+            "libcamerasrc ! video/x-raw,width=%d,height=%d,framerate=30/1,format=RGB ! "
+            "videoconvert ! video/x-raw,format=BGR ! appsink" % (width, height),
+            cv2.CAP_GSTREAMER
+        )
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return cap
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--thresh", type=float, default=0.45, help="nguong cosine")
+    ap.add_argument("--width",  type=int, default=640, help="do rong")
+    ap.add_argument("--height", type=int, default=480, help="do cao")
+    ap.add_argument("--no-picam", action="store_true", help="dung OpenCV capture thay vi PiCamera2")
+    # them cac tham so phat hien
+    ap.add_argument("--min-size", type=int, default=80, help="kich thuoc toi thieu cua mat")
+    ap.add_argument("--neighbors", type=int, default=5, help="minNeighbors")
+    ap.add_argument("--scale-factor", type=float, default=1.1, help="scaleFactor Haar")
+    ap.add_argument("--margin", type=float, default=0.18, help="margin cat mat")
+    args = ap.parse_args()
+
+    print(f"[INFO] model  : {MODEL_PATH}")
+    print(f"[INFO] index  : {INDEX_PATH}")
+    print(f"[READY] th={args.thresh} min={args.min_size} nei={args.neighbors} sf={args.scale_factor} margin={args.margin}")
+
+    # load model + index
+    mbf = MobileFaceNet(str(MODEL_PATH))
+    labels, embs = load_index()
+    embs = embs.astype(np.float32)
+
+    # chon nguon camera
+    use_picam = not args.no_picam
+    picam = None
+    cap = None
+    if use_picam:
+        try:
+            picam = cap_picam(args.width, args.height)
+        except Exception as e:
+            print("[WARN] picam loi -> fallback opencv:", e)
+            use_picam = False
+    if not use_picam:
+        cap = cap_opencv(args.width, args.height)
+
+    win = "live recognize (Picam)"
+    t0 = time.time(); frames = 0; fps = 0.0
+
+    try:
+        while True:
+            if use_picam:
+                frame = picam.capture_array()
+            else:
+                ok, frame = cap.read()
+                if not ok:
+                    print("capture loi"); break
+
+            results = recognize_faces(
+                mbf, labels, embs, frame, th=args.thresh,
+                scale_factor=args.scale_factor,
+                neighbors=args.neighbors,
+                min_size=args.min_size,
+                margin=args.margin
+            )
+
+            frames += 1
+            if frames % 10 == 0:
+                now = time.time()
+                fps = 10.0 / max(1e-6, (now - t0))
+                t0 = now
+
+            vis = frame.copy()
+            vis = draw_ui(vis, results, fps)
+            cv2.imshow(win, vis)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        cv2.destroyAllWindows()
+        if picam is not None:
+            try: picam.stop()
+            except: pass
+        if cap is not None:
+            cap.release()
+
+if __name__ == "__main__":
+    main()

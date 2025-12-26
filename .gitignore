@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+frontend/node_modules/
+frontend/.vite/
+dist/
+*.env
+dataset/
+encodings.pkl
+encodings.pickle
+*.jpg
+*.png
+node_modules

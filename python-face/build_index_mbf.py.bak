@@ -1,0 +1,86 @@
+# -*- coding: utf-8 -*-
+# build_index_mbf.py: tao index tu dataset voi tang cuong du lieu
+import os, time, glob
+import cv2
+import numpy as np
+from mobilefacenet_onnx import MobileFaceNet, l2norm
+from detect_face_haar import crop_face_bgr
+
+DATASET_DIR = os.path.join(os.path.dirname(__file__), "dataset")
+MODEL_PATH  = os.path.join(os.path.dirname(__file__), "models", "mobilefacenet.onnx")
+OUT_PATH    = os.path.join(os.path.dirname(__file__), "models", "encodings.npz")
+
+def clahe_bgr(img_bgr):
+    # can bang do sang theo kenh Y de giam anh huong den nhan dien
+    ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    y = clahe.apply(y)
+    ycrcb = cv2.merge([y, cr, cb])
+    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+def list_images(folder):
+    exts = (".jpg",".jpeg",".png",".bmp")
+    return [p for p in glob.glob(os.path.join(folder,"*")) if p.lower().endswith(exts)]
+
+def main():
+    print(f"[INFO] dataset = {DATASET_DIR}")
+    print(f"[INFO] model   = {MODEL_PATH}")
+    print(f"[INFO] out     = {OUT_PATH}")
+
+    t0 = time.time()
+    mbf = MobileFaceNet(MODEL_PATH)
+    print(f"[STEP] model ready. NHWC? {mbf.is_nhwc} size={mbf.size}")
+
+    labels, embs = [], []
+    ids = sorted([d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR,d))])
+    print(f"[STEP] found {len(ids)} label dirs: {ids}")
+
+    for pid in ids:
+        folder = os.path.join(DATASET_DIR, pid)
+        paths = list_images(folder)
+        print(f"[STEP] {pid}: {len(paths)} anh")
+        cnt = 0
+        for p in paths:
+            img = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is None: 
+                continue
+
+            face = crop_face_bgr(img, use_profile=True)
+            if face is None: 
+                # thu embed ca frame (khong khuyen khich nhung tranh bo sot)
+                face = img
+
+            # tang cuong: CLAHE + resize dung kich thuoc dau vao
+            face = clahe_bgr(face)
+            face = cv2.resize(face, (mbf.size, mbf.size), interpolation=cv2.INTER_AREA)
+
+            # 1) embed goc
+            e1 = mbf.embed_bgr(face)
+            if e1 is not None:
+                labels.append(pid)
+                embs.append(e1)
+                cnt += 1
+
+            # 2) embed flip ngang cho do ben huong quay dau
+            face_flip = cv2.flip(face, 1)
+            e2 = mbf.embed_bgr(face_flip)
+            if e2 is not None:
+                labels.append(pid)
+                embs.append(e2)
+                cnt += 1
+
+        print(f"[OK] {pid}: {cnt} vecs")
+
+    if not embs:
+        raise RuntimeError("Empty embeddings, check dataset path")
+
+    embs = np.vstack(embs).astype("float32")
+    labels = np.array(labels)
+    np.savez_compressed(OUT_PATH, labels=labels, embs=embs)
+
+    print(f"[DONE] saved index -> {OUT_PATH} | labels={len(set(labels))} | dim={embs.shape[1]} | vecs={len(labels)}")
+    print(f"[TIME] {time.time()-t0:.2f}s")
+
+if __name__ == "__main__":
+    main()
